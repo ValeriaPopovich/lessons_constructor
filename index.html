@@ -282,6 +282,12 @@
 
     .btn:hover { transform: translateY(-1px); }
     .btn:active { transform: scale(.97); }
+    .btn:disabled {
+      opacity: .48;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
 
     .btn-primary {
       color: #fff;
@@ -2399,6 +2405,152 @@
       flex-wrap: wrap;
     }
 
+    .import-modal-card {
+      width: min(540px, 100%);
+      padding: 22px;
+      border-radius: 22px;
+    }
+
+    .import-modal-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .import-modal-head h2 { margin-bottom: 4px; }
+    .import-modal-head p { margin: 0; line-height: 1.45; }
+
+    .import-modal-close {
+      width: 36px;
+      min-width: 36px;
+      height: 36px;
+    }
+
+    .import-choice-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .import-choice {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      width: 100%;
+      min-height: 76px;
+      padding: 13px 14px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      color: var(--text);
+      background: var(--surface);
+      text-align: left;
+      transition: border-color .16s ease, background .16s ease, transform .16s ease;
+    }
+
+    .import-choice:hover {
+      border-color: rgba(224, 86, 59, .44);
+      background: var(--accent-soft);
+      transform: translateY(-1px);
+    }
+
+    .import-choice__icon {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border-radius: 13px;
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .import-choice:hover .import-choice__icon { background: var(--surface); }
+    .import-choice__copy { min-width: 0; }
+    .import-choice__copy strong { display: block; margin-bottom: 2px; }
+    .import-choice__copy span {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+    .import-choice__arrow { color: var(--muted); }
+
+    .import-modal-note {
+      margin: 13px 2px 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .import-json-panel { display: grid; gap: 12px; }
+    .import-json-back {
+      justify-self: start;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 0;
+      border: 0;
+      color: var(--accent-deep);
+      background: transparent;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .import-json-field { display: grid; gap: 7px; }
+    .import-json-field label {
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 900;
+    }
+
+    .import-json-textarea {
+      min-height: 190px;
+      max-height: 42vh;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      resize: vertical;
+    }
+
+    .import-json-hint {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .import-json-hint code {
+      padding: 1px 4px;
+      border-radius: 5px;
+      color: var(--accent-deep);
+      background: var(--accent-soft);
+      font-size: .95em;
+    }
+
+    .import-error {
+      margin: 12px 0 0;
+      padding: 10px 12px;
+      border-radius: 12px;
+      color: var(--danger);
+      background: var(--danger-soft);
+      font-size: 13px;
+      font-weight: 750;
+      line-height: 1.4;
+    }
+
+    .import-json-panel .modal-actions { margin-top: 2px; }
+
+    @media (max-width: 560px) {
+      .import-modal-card { padding: 18px; border-radius: 20px; }
+      .import-choice { min-height: 72px; padding: 12px; }
+      .import-choice__icon { width: 38px; height: 38px; }
+      .import-json-textarea { min-height: 170px; }
+      .import-json-panel .modal-actions { display: grid; grid-template-columns: 1fr 1fr; }
+      .import-json-panel .modal-actions .btn { width: 100%; }
+    }
+
     .validation-list {
       display: grid;
       gap: 9px;
@@ -4401,6 +4553,7 @@
       let timerAudioContext = null;
       let lastUndoFocus = null;
       let lastSessionPersistAt = 0;
+      let closeActiveImportModal = null;
 
       const TEMPLATE_SEED_VERSION = 1;
 
@@ -5634,34 +5787,245 @@
         };
       }
 
-      function importData(file) {
-        const reader = new FileReader();
-        reader.onload = () => {
+      function dismissImportModal() {
+        if (closeActiveImportModal) {
+          closeActiveImportModal();
+          return;
+        }
+        document.querySelector(".import-modal")?.remove();
+      }
+
+      function showImportError(error) {
+        const errorNode = document.querySelector(".import-modal [data-import-error]");
+        let message = "Не удалось импортировать данные. Попробуйте ещё раз.";
+
+        if (error?.code === "empty-json") {
+          message = "Вставьте JSON из ответа GPT.";
+        } else if (error?.code === "unknown-format") {
+          message = "Формат не распознан. Нужен JSON урока или резервной копии конструктора.";
+        } else if (error instanceof SyntaxError) {
+          message = "Не удалось прочитать JSON. Проверьте, что ответ скопирован полностью и в нём не пропущены скобки или запятые.";
+        } else if (error?.code === "file-read") {
+          message = "Не удалось прочитать файл. Попробуйте выбрать его ещё раз.";
+        }
+
+        if (!errorNode) {
+          alert(message);
+          return;
+        }
+        errorNode.textContent = message;
+        errorNode.classList.remove("hidden");
+      }
+
+      function clearImportError() {
+        const errorNode = document.querySelector(".import-modal [data-import-error]");
+        if (!errorNode) return;
+        errorNode.textContent = "";
+        errorNode.classList.add("hidden");
+      }
+
+      function parseImportText(rawText) {
+        const text = String(rawText || "").trim();
+        if (!text) {
+          const error = new Error("Empty JSON");
+          error.code = "empty-json";
+          throw error;
+        }
+
+        const candidates = [text];
+        const fencedBlock = /```(?:json)?\s*([\s\S]*?)```/gi;
+        let match;
+        while ((match = fencedBlock.exec(text))) {
+          if (match[1]?.trim()) candidates.push(match[1].trim());
+        }
+
+        const objectStart = text.indexOf("{");
+        const arrayStart = text.indexOf("[");
+        const starts = [objectStart, arrayStart].filter(index => index >= 0);
+        if (starts.length) {
+          const start = Math.min(...starts);
+          const closing = text[start] === "{" ? "}" : "]";
+          const end = text.lastIndexOf(closing);
+          if (end > start) candidates.push(text.slice(start, end + 1));
+        }
+
+        let syntaxError = null;
+        for (const candidate of [...new Set(candidates)]) {
           try {
-            const data = JSON.parse(reader.result);
-            if (data.kind === "lessonBuilderLesson" && data.lesson) {
-              const [lesson] = addImportedLessons([data.lesson]);
-              state.currentLessonId = lesson.id;
-              state.view = "editor";
-              state.editorUndo = null;
-              state.editorCollapsed = {};
-              persist();
-              render();
-              toast("Урок загружен и открыт");
-              return;
-            }
-
-            if (data.kind === "lessonBuilderBackup" && Array.isArray(data.lessons)) {
-              showBackupImportModal(data);
-              return;
-            }
-
-            throw new Error("Неизвестный формат");
+            return JSON.parse(candidate);
           } catch (error) {
-            alert("Не удалось загрузить файл. Проверьте, что это файл урока или резервная копия конструктора.");
+            syntaxError = error;
           }
+        }
+        throw syntaxError || new SyntaxError("Invalid JSON");
+      }
+
+      function applyImportedData(data) {
+        const rawLesson = data?.kind === "lessonBuilderLesson" && data.lesson
+          ? data.lesson
+          : (data && typeof data === "object" && !Array.isArray(data) && Array.isArray(data.blocks) ? data : null);
+
+        if (rawLesson) {
+          dismissImportModal();
+          const [lesson] = addImportedLessons([rawLesson]);
+          state.currentLessonId = lesson.id;
+          state.view = "editor";
+          state.editorUndo = null;
+          state.editorCollapsed = {};
+          persist();
+          render();
+          toast("Урок импортирован и открыт");
+          return;
+        }
+
+        const isBackup = data?.kind === "lessonBuilderBackup" && Array.isArray(data.lessons);
+        const isPlainBackup = data && typeof data === "object" && !Array.isArray(data) && Array.isArray(data.lessons);
+        if (isBackup || isPlainBackup) {
+          dismissImportModal();
+          showBackupImportModal(data);
+          return;
+        }
+
+        const error = new Error("Unknown import format");
+        error.code = "unknown-format";
+        throw error;
+      }
+
+      function importDataFromText(text) {
+        try {
+          applyImportedData(parseImportText(text));
+        } catch (error) {
+          showImportError(error);
+        }
+      }
+
+      function importData(file) {
+        clearImportError();
+        const reader = new FileReader();
+        reader.onload = () => importDataFromText(reader.result);
+        reader.onerror = () => {
+          const error = new Error("File read error");
+          error.code = "file-read";
+          showImportError(error);
         };
         reader.readAsText(file);
+      }
+
+      function showImportModal() {
+        dismissImportModal();
+        document.querySelector(".modal")?.remove();
+
+        const modal = document.createElement("div");
+        modal.className = "modal import-modal";
+        modal.innerHTML = `
+          <div class="modal-card import-modal-card" role="dialog" aria-modal="true" aria-labelledby="importModalTitle">
+            <div class="import-modal-head">
+              <div>
+                <h2 id="importModalTitle" data-import-title>Импорт урока</h2>
+                <p class="muted" data-import-subtitle>Выберите, откуда взять данные.</p>
+              </div>
+              <button type="button" class="icon-btn icon-btn--ghost import-modal-close" data-import-close aria-label="Закрыть">${icon("x", 18)}</button>
+            </div>
+
+            <div class="import-choice-list" data-import-choices>
+              <button type="button" class="import-choice" data-import-file>
+                <span class="import-choice__icon">${icon("upload", 21)}</span>
+                <span class="import-choice__copy">
+                  <strong>Выбрать JSON-файл</strong>
+                  <span>Если GPT создал файл для скачивания</span>
+                </span>
+                <span class="import-choice__arrow">${icon("chevron-right", 18)}</span>
+              </button>
+              <button type="button" class="import-choice" data-import-paste>
+                <span class="import-choice__icon">${icon("copy", 21)}</span>
+                <span class="import-choice__copy">
+                  <strong>Вставить JSON</strong>
+                  <span>Если GPT показал код прямо в сообщении</span>
+                </span>
+                <span class="import-choice__arrow">${icon("chevron-right", 18)}</span>
+              </button>
+            </div>
+
+            <p class="import-modal-note" data-import-note>Подойдут урок или резервная копия, созданные для этого конструктора.</p>
+
+            <div class="import-json-panel hidden" data-import-json-panel>
+              <button type="button" class="import-json-back" data-import-back>${icon("chevron-left", 15)} К выбору способа</button>
+              <div class="import-json-field">
+                <label for="importJsonText">JSON из ответа GPT</label>
+                <textarea
+                  id="importJsonText"
+                  class="textarea import-json-textarea"
+                  data-import-json-text
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder='Вставьте сюда { "kind": "lessonBuilderLesson", ... }'
+                ></textarea>
+                <p class="import-json-hint">Можно вставить ответ целиком. Обёртку <code>&#96;&#96;&#96;json</code> удалять не нужно — конструктор найдёт JSON внутри.</p>
+              </div>
+              <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" data-import-close>Отмена</button>
+                <button type="button" class="btn btn-primary" data-import-submit disabled>Импортировать</button>
+              </div>
+            </div>
+
+            <p class="import-error hidden" data-import-error role="alert"></p>
+          </div>
+        `;
+
+        const choices = modal.querySelector("[data-import-choices]");
+        const note = modal.querySelector("[data-import-note]");
+        const panel = modal.querySelector("[data-import-json-panel]");
+        const textarea = modal.querySelector("[data-import-json-text]");
+        const submit = modal.querySelector("[data-import-submit]");
+        const title = modal.querySelector("[data-import-title]");
+        const subtitle = modal.querySelector("[data-import-subtitle]");
+
+        const close = () => {
+          document.removeEventListener("keydown", onKeydown);
+          modal.remove();
+          if (closeActiveImportModal === close) closeActiveImportModal = null;
+        };
+        const showChoices = () => {
+          clearImportError();
+          choices.classList.remove("hidden");
+          note.classList.remove("hidden");
+          panel.classList.add("hidden");
+          title.textContent = "Импорт урока";
+          subtitle.textContent = "Выберите, откуда взять данные.";
+          modal.querySelector("[data-import-file]")?.focus();
+        };
+        const showPasteField = () => {
+          clearImportError();
+          choices.classList.add("hidden");
+          note.classList.add("hidden");
+          panel.classList.remove("hidden");
+          title.textContent = "Вставьте JSON";
+          subtitle.textContent = "Скопируйте код из ответа GPT без изменений.";
+          textarea.focus();
+        };
+        const onKeydown = event => {
+          if (event.key === "Escape") close();
+        };
+
+        closeActiveImportModal = close;
+        modal.querySelectorAll("[data-import-close]").forEach(button => button.addEventListener("click", close));
+        modal.querySelector("[data-import-file]").addEventListener("click", () => {
+          clearImportError();
+          importInput.click();
+        });
+        modal.querySelector("[data-import-paste]").addEventListener("click", showPasteField);
+        modal.querySelector("[data-import-back]").addEventListener("click", showChoices);
+        textarea.addEventListener("input", () => {
+          submit.disabled = !textarea.value.trim();
+          clearImportError();
+        });
+        submit.addEventListener("click", () => importDataFromText(textarea.value));
+        modal.addEventListener("click", event => {
+          if (event.target === modal) close();
+        });
+        document.addEventListener("keydown", onKeydown);
+        document.body.appendChild(modal);
+        modal.querySelector("[data-import-file]").focus();
       }
 
       function showConfirm(title, text, onConfirm) {
@@ -8790,7 +9154,7 @@
         if (action === "duplicate-lesson") duplicateLesson(button.dataset.id);
         if (action === "export-lesson") exportLesson(button.dataset.id);
         if (action === "export-all") exportAll();
-        if (action === "import") importInput.click();
+        if (action === "import") showImportModal();
 
         if (action === "play-current") requestLessonLaunch(state.currentLessonId);
         if (action === "editor-step") {
