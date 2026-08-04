@@ -5253,7 +5253,7 @@
         const add = (message, block = null) => issues.push({
           message,
           blockId: block?.id || null,
-          blockTitle: block?.title || (block ? BLOCKS[block.type]?.label : "Настройки урока")
+          blockTitle: block?.title || (block ? BLOCKS[block.type]?.label || "Упражнение" : "Настройки урока")
         });
         const filled = value => Boolean(String(value || "").trim());
 
@@ -5532,7 +5532,7 @@
         const common = {
           id: uid("block"),
           type,
-          title: BLOCKS[type].label,
+          title: BLOCKS[type]?.label || "Упражнение",
           timerEnabled: false,
           timerDuration: 300,
           images: []
@@ -6202,11 +6202,11 @@
               ${group.types.map(type => {
                 const meta = BLOCKS[type];
                 return `
-                  <button class="palette-btn exercise-template" draggable="true" data-exercise-template="${type}" data-action="add-block" data-type="${type}" title="${escapeHtml(meta.hint)}">
+                  <button class="palette-btn exercise-template" draggable="true" data-exercise-template="${type}" data-action="add-block" data-type="${type}" title="${escapeHtml(meta?.hint || "")}">
                     <span class="exercise-template__icon">${blockIcon(type, 22)}</span>
                     <span class="exercise-template__copy">
-                      <strong>${meta.label}</strong>
-                      <span>${meta.hint}</span>
+                      <strong>${meta?.label || "Упражнение"}</strong>
+                      <span>${meta?.hint || ""}</span>
                     </span>
                     <span class="exercise-template__add">${icon("plus", 20)}</span>
                   </button>
@@ -6299,7 +6299,7 @@
                   <span class="plan-row__num">${String(index + 1).padStart(2, "0")}</span>
                   <span class="plan-row__ico">${blockIcon(block.type, 18)}</span>
                   <span class="plan-row__text">
-                    <span class="plan-row__title">${escapeHtml(block.title || BLOCKS[block.type].label)}</span>
+                    <span class="plan-row__title">${escapeHtml(block.title || BLOCKS[block.type]?.label || "Упражнение")}</span>
                     <span class="plan-row__status">${escapeHtml(blockSummary(block))}</span>
                   </span>
                 </button>
@@ -6452,9 +6452,9 @@
             <div class="block-title">
               ${block.type === "homework" ? `<span class="drag-handle" title="Домашнее задание всегда последнее" aria-hidden="true">⌑</span>` : `<button class="drag-handle" draggable="true" data-editor-drag-handle data-block-id="${block.id}" title="Перетащить упражнение" aria-label="Перетащить упражнение">⠿</button>`}
               <span class="exercise-number">${String(index + 1).padStart(2, "0")}</span>
-              <span class="exercise-icon" aria-hidden="true">${meta.icon}</span>
+              <span class="exercise-icon" aria-hidden="true">${meta?.icon || "◇"}</span>
               <span class="exercise-title-copy">
-                <span>${formatMathInline(block.title || meta.label)}</span>
+                <span>${formatMathInline(block.title || meta?.label || "Упражнение")}</span>
                 <span class="block-summary">${escapeHtml(blockSummary(block))}${block.type === "homework" ? " · последний этап" : ""}</span>
               </span>
               ${blockHelpEditor(block)}
@@ -7039,8 +7039,8 @@
             <div class="detail-head">
               <span class="detail-head__ico">${blockIcon(block.type)}</span>
               <span class="detail-head__meta">
-                <span class="detail-head__eyebrow">${escapeHtml(meta.label)}</span>
-                <span class="detail-head__title">${formatMathInline(block.title || meta.label)}</span>
+                <span class="detail-head__eyebrow">${escapeHtml(meta?.label || "Упражнение")}</span>
+                <span class="detail-head__title">${formatMathInline(block.title || meta?.label || "Упражнение")}</span>
               </span>
               <span class="detail-head__actions">
                 ${answerField ? `<button class="icon-btn ${block[answerField] ? "is-on" : ""}" data-label="Ответ сразу" data-action="toggle-block-field" data-id="${block.id}" data-field="${answerField}" title="${block[answerField] ? "Показ ответа включён" : "Показывать ответ сразу"}" aria-label="Показывать ответ сразу" aria-pressed="${block[answerField] ? "true" : "false"}">${icon("eye")}</button>` : ""}
@@ -7823,8 +7823,8 @@
           <div class="player-block-heading">
             <div class="player-block-heading__icon" aria-hidden="true">${blockIcon(block.type, 34)}</div>
             <div>
-              <span class="eyebrow">Этап ${Math.max(1, state.player.index + 1)} · ${meta.label}</span>
-              <h2>${formatMathInline(block.title || meta.label)}</h2>
+              <span class="eyebrow">Этап ${Math.max(1, state.player.index + 1)} · ${meta?.label || "Упражнение"}</span>
+              <h2>${formatMathInline(block.title || meta?.label || "Упражнение")}</h2>
             </div>
           </div>
           ${renderBlockTimer(block)}
