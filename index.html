@@ -715,6 +715,11 @@
       color: var(--accent);
       background: var(--accent-soft);
     }
+    .chip--invalid {
+      color: var(--danger);
+      background: var(--danger-soft);
+      cursor: help;
+    }
 
     .lesson-card__actions {
       display: grid;
@@ -4390,6 +4395,23 @@
         homework: { label: "Домашнее задание", icon: "⌂", hint: "Работа после урока" }
       };
 
+      const INVALID_LESSON_REGEN_MESSAGE = "Удалите урок и перегенерируйте его в GPT заново.";
+
+      function unsupportedBlockTypes(lesson) {
+        const blocks = Array.isArray(lesson?.blocks) ? lesson.blocks : [];
+        return [...new Set(
+          blocks
+            .filter(block => !block || !Object.prototype.hasOwnProperty.call(BLOCKS, block.type))
+            .map(block => String(block?.type || "не указан"))
+        )];
+      }
+
+      function invalidLessonTooltip(lesson) {
+        const types = unsupportedBlockTypes(lesson);
+        if (!types.length) return "";
+        return `Неподдерживаемые типы упражнений: ${types.join(", ")}. ${INVALID_LESSON_REGEN_MESSAGE}`;
+      }
+
       const EXERCISE_GROUPS = [
         { title: "Материалы и проверка", types: ["theory", "practice", "test", "homework"] },
         { title: "Игры", types: ["trueFalse", "shortAnswer", "fillBlanks", "wheel", "findError", "sequence", "matching", "categories"] }
@@ -5392,6 +5414,10 @@
       function requestLessonLaunch(lessonId) {
         const lesson = state.lessons.find(item => item.id === lessonId);
         if (!lesson) return;
+        if (unsupportedBlockTypes(lesson).length) {
+          toast(INVALID_LESSON_REGEN_MESSAGE);
+          return;
+        }
         const issues = validateLesson(lesson);
         if (issues.length) return showValidationModal(lesson, issues, true);
         startPlayer(lessonId, true);
@@ -5868,13 +5894,14 @@
         if (rawLesson) {
           dismissImportModal();
           const [lesson] = addImportedLessons([rawLesson]);
-          state.currentLessonId = lesson.id;
-          state.view = "editor";
+          const hasInvalidType = unsupportedBlockTypes(lesson).length > 0;
+          state.currentLessonId = hasInvalidType ? null : lesson.id;
+          state.view = hasInvalidType ? "library" : "editor";
           state.editorUndo = null;
           state.editorCollapsed = {};
           persist();
           render();
-          toast("Урок импортирован и открыт");
+          toast(hasInvalidType ? "Урок импортирован с неподдерживаемым типом" : "Урок импортирован и открыт");
           return;
         }
 
@@ -6109,6 +6136,8 @@
         });
 
         const cards = lessons.map(lesson => {
+          const invalidTooltip = invalidLessonTooltip(lesson);
+          const hasInvalidType = Boolean(invalidTooltip);
           return `
             <article class="lesson-card">
               <div class="lesson-card__top">
@@ -6117,6 +6146,7 @@
               <h3>${escapeHtml(lesson.title || "Без названия")}</h3>
               <p>${escapeHtml(lesson.topic || lesson.description || "Добавьте тему урока")}</p>
               <div class="chips">
+                ${hasInvalidType ? `<span class="chip chip--invalid" tabindex="0" title="${escapeHtml(invalidTooltip)}">Неверный тип урока</span>` : ""}
                 ${lesson.isTemplate ? `<span class="chip chip--template">Шаблон</span>` : ""}
                 ${lesson.subject ? `<span class="chip">${escapeHtml(lesson.subject)}</span>` : ""}
                 ${lesson.grade ? `<span class="chip">${escapeHtml(lesson.grade)}</span>` : ""}
@@ -6124,8 +6154,8 @@
                 ${lessonTimedSeconds(lesson) ? `<span class="chip">${formatApproxDuration(lessonTimedSeconds(lesson))}</span>` : ""}
               </div>
               <div class="lesson-card__actions">
-                <button class="btn btn-primary" data-action="play-lesson" data-id="${lesson.id}">${icon("play", 18)} Запустить</button>
-                <button class="btn btn-secondary" data-action="edit-lesson" data-id="${lesson.id}">${icon("pencil", 18)} Изменить</button>
+                <button class="btn btn-primary" data-action="play-lesson" data-id="${lesson.id}" ${hasInvalidType ? "disabled" : ""}>${icon("play", 18)} Запустить</button>
+                <button class="btn btn-secondary" data-action="edit-lesson" data-id="${lesson.id}" ${hasInvalidType ? "disabled" : ""}>${icon("pencil", 18)} Изменить</button>
                 <details class="menu">
                   <summary aria-label="Ещё действия для урока «${escapeHtml(lesson.title || "Без названия")}»" title="Ещё">${icon("more", 18)}</summary>
                   <div class="menu__list">
@@ -6188,6 +6218,13 @@
         }
         app.classList.toggle("simple-mode", state.settings.simpleMode !== false);
         normalizeLesson(lesson);
+        if (unsupportedBlockTypes(lesson).length) {
+          state.currentLessonId = null;
+          state.view = "library";
+          render();
+          toast(INVALID_LESSON_REGEN_MESSAGE);
+          return;
+        }
         state.editorStep = Math.min(3, Math.max(1, Number(state.editorStep) || 1));
         const blockCards = lesson.blocks.map((block, index) => renderBlockEditor(block, index, lesson.blocks.length)).join("");
         const issues = validateLesson(lesson);
@@ -9139,11 +9176,15 @@
         }
         if (action === "create-lesson") createLesson();
         if (action === "edit-lesson") {
+          const editedLesson = state.lessons.find(item => item.id === button.dataset.id);
+          if (!editedLesson || unsupportedBlockTypes(editedLesson).length) {
+            toast(INVALID_LESSON_REGEN_MESSAGE);
+            return;
+          }
           state.currentLessonId = button.dataset.id;
           state.view = "editor";
-          state.editorStep = state.lessons.find(item => item.id === button.dataset.id)?.blocks?.length ? 2 : 1;
+          state.editorStep = editedLesson.blocks?.length ? 2 : 1;
           state.editorUndo = null;
-          const editedLesson = state.lessons.find(item => item.id === button.dataset.id);
           state.editorCollapsed = Object.fromEntries((editedLesson?.blocks || []).map((block, index) => [block.id, index !== 0]));
           state.editorSelectedBlockId = editedLesson?.blocks?.[0]?.id || null;
           state.paletteOpen = false;
