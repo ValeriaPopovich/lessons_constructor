@@ -1046,7 +1046,7 @@
 
     .player-card {
       min-height: 520px;
-      padding: clamp(24px, 5vw, 56px);
+      padding: clamp(24px, 5vw, 24px);
       border-radius: 30px;
     }
 
@@ -1071,7 +1071,7 @@
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      margin-top: 16px;
+      margin-top: 12px;
     }
 
     .player-block {
@@ -2031,7 +2031,7 @@
     .cover-screen .cover-content { max-width: 760px; }
 
     .solution-board {
-      margin-top: 18px;
+      margin-top: 12px;
       padding: 18px;
       border: 1px solid rgba(234, 222, 212, .94);
       border-radius: 24px;
@@ -4109,7 +4109,8 @@
       border-radius: 13px;
       background: #fff;
     }
-    .block-image-tile img {
+    .block-image-tile img,
+    .block-image-tile__placeholder {
       display: block;
       width: 100%;
       height: 132px;
@@ -4377,8 +4378,30 @@
         attempts: "lessonBuilder_attempts_v1",
         settings: "lessonBuilder_settings_v1",
         session: "lessonBuilder_active_session_v1",
-        templateSeed: "lessonBuilder_template_seed_v1"
+        templateSeed: "lessonBuilder_template_seed_v1",
+        migrationFlag: "lessonBuilder_idb_migration_v1"
       };
+
+      const IDB = {
+        name: "lessonBuilder",
+        version: 1,
+        stores: {
+          lessons: "lessons",
+          attempts: "attempts",
+          images: "images",
+          session: "activeSession",
+          meta: "meta"
+        }
+      };
+
+      let db = null;
+      let dbAvailable = false;
+      let bootReady = false;
+      const imageSrcMap = new Map();
+      const imageBlobMap = new Map();
+      const persistQueue = { chain: Promise.resolve() };
+      let saveStatus = { state: "idle", message: "Сохранено", error: null };
+      let saveStatusTimer = null;
 
       const BLOCKS = {
         theory: { label: "Теория", icon: "📖", hint: "Объяснение новой темы" },
@@ -4755,20 +4778,11 @@
         ];
       }
 
-      const storedLessons = load(STORAGE.lessons, []).map(normalizeLesson);
-      const templatesAlreadySeeded = Number(load(STORAGE.templateSeed, 0)) >= TEMPLATE_SEED_VERSION;
-      const initialLessons = templatesAlreadySeeded
-        ? dedupeLessonTitles(storedLessons)
-        : dedupeLessonTitles([
-            ...builtInLessonTemplates().filter(template => !storedLessons.some(lesson => lesson.id === template.id)).map(normalizeLesson),
-            ...storedLessons
-          ]);
-
       let state = {
         view: "library",
-        lessons: initialLessons,
-        attempts: load(STORAGE.attempts, []),
-        settings: { timerSound: true, simpleMode: true, ...load(STORAGE.settings, {}) },
+        lessons: [],
+        attempts: [],
+        settings: { timerSound: true, simpleMode: true },
         currentLessonId: null,
         player: null,
         search: "",
@@ -4778,17 +4792,6 @@
         paletteOpen: false,
         editorUndo: null
       };
-
-      if (!templatesAlreadySeeded) {
-        try {
-          localStorage.setItem(STORAGE.lessons, JSON.stringify(state.lessons));
-          localStorage.setItem(STORAGE.templateSeed, JSON.stringify(TEMPLATE_SEED_VERSION));
-        } catch (error) {
-          console.warn("Не удалось сохранить встроенные шаблоны:", error);
-        }
-      }
-
-      restoreSavedSession(load(STORAGE.session, null));
 
       function uid(prefix = "id") {
         return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -4804,16 +4807,278 @@
         }
       }
 
-      function persist() {
+      function idbRequest(request) {
+        return new Promise((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      function idbStore(storeName, mode = "readonly") {
+        if (!db) throw new Error("IndexedDB не открыта");
+        const tx = db.transaction(storeName, mode);
+        return tx.objectStore(storeName);
+      }
+
+      async function idbGet(store, key) { return idbRequest(idbStore(store).get(key)); }
+      async function idbGetAll(store) { return idbRequest(idbStore(store).getAll()); }
+      async function idbPut(store, value) { return idbRequest(idbStore(store, "readwrite").put(value)); }
+      async function idbDelete(store, key) { return idbRequest(idbStore(store, "readwrite").delete(key)); }
+      async function idbClear(store) { return idbRequest(idbStore(store, "readwrite").clear()); }
+
+      function openDB() {
+        return new Promise((resolve, reject) => {
+          if (!window.indexedDB) {
+            reject(new Error("IndexedDB недоступна"));
+            return;
+          }
+          const req = window.indexedDB.open(IDB.name, IDB.version);
+          req.onupgradeneeded = () => {
+            const database = req.result;
+            if (!database.objectStoreNames.contains(IDB.stores.lessons)) database.createObjectStore(IDB.stores.lessons, { keyPath: "id" });
+            if (!database.objectStoreNames.contains(IDB.stores.attempts)) database.createObjectStore(IDB.stores.attempts, { keyPath: "id" });
+            if (!database.objectStoreNames.contains(IDB.stores.images)) database.createObjectStore(IDB.stores.images, { keyPath: "id" });
+            if (!database.objectStoreNames.contains(IDB.stores.session)) database.createObjectStore(IDB.stores.session, { keyPath: "key" });
+            if (!database.objectStoreNames.contains(IDB.stores.meta)) database.createObjectStore(IDB.stores.meta, { keyPath: "key" });
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+          req.onblocked = () => reject(new Error("IndexedDB заблокирована другой вкладкой"));
+        });
+      }
+
+      function enqueue(task) {
+        persistQueue.chain = persistQueue.chain.then(task, task).catch(error => {
+          console.warn("Ошибка записи в IndexedDB:", error);
+          setSaveStatus({ state: "error", message: "Не сохранено", error });
+        });
+        return persistQueue.chain;
+      }
+
+      function setSaveStatus(next) {
+        saveStatus = { ...saveStatus, ...next };
+        clearTimeout(saveStatusTimer);
+        if (saveStatus.state === "saved") {
+          saveStatusTimer = setTimeout(() => {
+            saveStatus = { state: "idle", message: "Сохранено", error: null };
+            renderSaveStatus();
+          }, 1600);
+        }
+        renderSaveStatus();
+      }
+
+      function renderSaveStatus() {
+        const widget = document.getElementById("saveStatusWidget");
+        if (!widget) return;
+        widget.classList.remove("is-idle", "is-saving", "is-saved", "is-error");
+        widget.classList.add(`is-${saveStatus.state}`);
+        widget.hidden = saveStatus.state === "idle";
+        const label = widget.querySelector("[data-save-status-label]");
+        if (label) label.textContent = saveStatus.message;
+        const action = widget.querySelector("[data-save-status-action]");
+        if (action) action.hidden = saveStatus.state !== "error";
+      }
+
+      function ensureSaveStatusWidget() {
+        if (document.getElementById("saveStatusWidget")) return;
+        const style = document.createElement("style");
+        style.textContent = `
+          #saveStatusWidget {
+            position: fixed;
+            top: 14px;
+            right: 14px;
+            z-index: 9999;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            font: 500 13px/1.2 var(--font-body, system-ui, sans-serif);
+            background: var(--surface, #fff);
+            color: var(--text, #1a1a1a);
+            box-shadow: 0 6px 22px rgba(0, 0, 0, 0.12);
+            border: 1px solid rgba(0, 0, 0, 0.05);
+            transition: opacity .2s ease, transform .2s ease;
+          }
+          #saveStatusWidget[hidden] { display: none; }
+          #saveStatusWidget .save-status-dot { line-height: 1; }
+          #saveStatusWidget.is-saving { background: #fff8e1; color: #6b4a00; }
+          #saveStatusWidget.is-saved { background: #e6f7ec; color: #1f6f3d; }
+          #saveStatusWidget.is-error { background: #fdecec; color: #9b1c1c; border-color: rgba(155, 28, 28, 0.2); }
+          #saveStatusWidget .save-status-action {
+            border: 0;
+            background: #9b1c1c;
+            color: #fff;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            cursor: pointer;
+          }
+          #saveStatusWidget .save-status-action[hidden] { display: none; }
+          @media (max-width: 600px) {
+            #saveStatusWidget { top: 8px; right: 8px; font-size: 12px; padding: 6px 10px; }
+          }
+        `;
+        document.head.appendChild(style);
+        const widget = document.createElement("div");
+        widget.id = "saveStatusWidget";
+        widget.hidden = true;
+        widget.innerHTML = `
+          <span class="save-status-dot" aria-hidden="true">●</span>
+          <span data-save-status-label>Сохранено</span>
+          <button type="button" class="save-status-action" data-save-status-action data-action="export-all" hidden>Экспортировать</button>
+        `;
+        document.body.appendChild(widget);
+        const actionBtn = widget.querySelector("[data-save-status-action]");
+        if (actionBtn) actionBtn.addEventListener("click", () => { exportAll(); });
+      }
+
+      function serializeLessonForDb(lesson) {
+        return {
+          ...lesson,
+          blocks: (lesson.blocks || []).map(block => {
+            if (Array.isArray(block.images)) {
+              return {
+                ...block,
+                images: block.images.map(img => ({
+                  id: img.id,
+                  name: img.name,
+                  width: img.width,
+                  height: img.height,
+                  type: img.type || "image/webp"
+                }))
+              };
+            }
+            return { ...block };
+          })
+        };
+      }
+
+      function hydrateLessonImages(lesson) {
+        (lesson.blocks || []).forEach(block => {
+          if (Array.isArray(block.images)) {
+            block.images = block.images.map(img => {
+              const cached = imageSrcMap.get(img.id);
+              return {
+                id: img.id,
+                name: img.name || "Изображение",
+                width: img.width || 0,
+                height: img.height || 0,
+                type: img.type || "image/webp",
+                data: typeof img.data === "string" && img.data ? img.data : (cached || "")
+              };
+            });
+          }
+        });
+        return lesson;
+      }
+
+      async function storeImageBlob(id, blob, meta = {}) {
+        const record = {
+          id,
+          blob,
+          name: meta.name || "Изображение",
+          width: meta.width || 0,
+          height: meta.height || 0,
+          type: blob.type || meta.type || "image/webp",
+          createdAt: new Date().toISOString()
+        };
+        if (dbAvailable) await idbPut(IDB.stores.images, record);
+        imageBlobMap.set(id, blob);
+        const previous = imageSrcMap.get(id);
+        if (previous) { try { URL.revokeObjectURL(previous); } catch (_) {} }
+        imageSrcMap.set(id, URL.createObjectURL(blob));
+        return record;
+      }
+
+      function dataUrlToBlob(dataUrl) {
+        const match = /^data:([^;]+);base64,(.*)$/i.exec(dataUrl || "");
+        if (!match) return null;
+        try {
+          const binary = atob(match[2]);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+          return new Blob([bytes], { type: match[1] });
+        } catch (error) {
+          console.warn("Не удалось разобрать data-URL:", error);
+          return null;
+        }
+      }
+
+      function blobToDataUrl(blob) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(blob);
+        });
+      }
+
+      async function persistLesson(lesson) {
+        if (!bootReady) return;
+        if (!dbAvailable) { persistLegacyAll(); return; }
+        setSaveStatus({ state: "saving", message: "Сохраняем…" });
+        return enqueue(async () => {
+          await idbPut(IDB.stores.lessons, serializeLessonForDb(lesson));
+          await idbPut(IDB.stores.meta, { key: "attempts", value: state.attempts });
+          await idbPut(IDB.stores.meta, { key: "settings", value: state.settings });
+          await writeActiveSession();
+          setSaveStatus({ state: "saved", message: "Сохранено", error: null });
+        });
+      }
+
+      async function persistAll() {
+        if (!bootReady) return;
+        if (!dbAvailable) { persistLegacyAll(); return; }
+        setSaveStatus({ state: "saving", message: "Сохраняем…" });
+        return enqueue(async () => {
+          const existing = await idbGetAll(IDB.stores.lessons);
+          const currentIds = new Set(state.lessons.map(lesson => lesson.id));
+          for (const record of existing) {
+            if (!currentIds.has(record.id)) await idbDelete(IDB.stores.lessons, record.id);
+          }
+          for (const lesson of state.lessons) await idbPut(IDB.stores.lessons, serializeLessonForDb(lesson));
+          await idbPut(IDB.stores.meta, { key: "attempts", value: state.attempts });
+          await idbPut(IDB.stores.meta, { key: "settings", value: state.settings });
+          await writeActiveSession();
+          setSaveStatus({ state: "saved", message: "Сохранено", error: null });
+        });
+      }
+
+      async function persistLessonDelete(id) {
+        if (!bootReady) return;
+        if (!dbAvailable) { persistLegacyAll(); return; }
+        setSaveStatus({ state: "saving", message: "Сохраняем…" });
+        return enqueue(async () => {
+          await idbDelete(IDB.stores.lessons, id);
+          await idbPut(IDB.stores.meta, { key: "attempts", value: state.attempts });
+          setSaveStatus({ state: "saved", message: "Сохранено", error: null });
+        });
+      }
+
+      async function persistSettingsOnly() {
+        if (!bootReady) return;
+        if (!dbAvailable) { persistLegacyAll(); return; }
+        setSaveStatus({ state: "saving", message: "Сохраняем…" });
+        return enqueue(async () => {
+          await idbPut(IDB.stores.meta, { key: "settings", value: state.settings });
+          setSaveStatus({ state: "saved", message: "Сохранено", error: null });
+        });
+      }
+
+      function persistLegacyAll() {
         try {
           localStorage.setItem(STORAGE.lessons, JSON.stringify(state.lessons));
           localStorage.setItem(STORAGE.attempts, JSON.stringify(state.attempts));
           localStorage.setItem(STORAGE.settings, JSON.stringify(state.settings));
-          persistAppSession();
+          setSaveStatus({ state: "saved", message: "Сохранено (запасное хранилище)" });
         } catch (error) {
           console.warn("Не удалось сохранить данные в localStorage:", error);
+          setSaveStatus({ state: "error", message: "Не сохранено", error });
         }
       }
+
+      function persist() { persistAll(); }
 
       function restoreSavedSession(saved) {
         if (!saved || typeof saved !== "object") return;
@@ -4847,49 +5112,64 @@
             color: raw.boardTool?.color || "#2b2434",
             size: Math.min(18, Math.max(1, Number(raw.boardTool?.size) || 4))
           },
-          boardCollapsed: Boolean(raw.boardCollapsed),
+          boardCollapsed: raw.boardCollapsed === undefined ? true : Boolean(raw.boardCollapsed),
           sessionId: raw.sessionId || uid("session")
         };
       }
 
-      function persistAppSession(force = true) {
-        try {
-          const lesson = currentLesson();
-          if (!lesson || (state.view !== "editor" && state.view !== "player")) {
-            localStorage.removeItem(STORAGE.session);
-            return;
-          }
-          const now = Date.now();
-          if (!force && now - lastSessionPersistAt < 900) return;
-          lastSessionPersistAt = now;
-
-          const payload = {
-            view: state.view,
-            currentLessonId: lesson.id,
-            editorCollapsed: state.editorCollapsed,
-            savedAt: new Date().toISOString(),
-            player: null
-          };
-          if (state.view === "player" && state.player) {
-            payload.player = {
-              ...state.player,
-              boardHistory: {}
-            };
-          }
-          try {
-            localStorage.setItem(STORAGE.session, JSON.stringify(payload));
-          } catch (error) {
-            if (payload.player) {
-              payload.player.drawings = {};
-              payload.player.boardHistory = {};
-              localStorage.setItem(STORAGE.session, JSON.stringify(payload));
-            } else {
-              throw error;
-            }
-          }
-        } catch (error) {
-          console.warn("Не удалось сохранить текущий прогресс урока:", error);
+      function buildSessionPayload() {
+        const lesson = currentLesson();
+        if (!lesson || (state.view !== "editor" && state.view !== "player")) return null;
+        const payload = {
+          key: "current",
+          view: state.view,
+          currentLessonId: lesson.id,
+          editorCollapsed: state.editorCollapsed,
+          savedAt: new Date().toISOString(),
+          player: null
+        };
+        if (state.view === "player" && state.player) {
+          payload.player = { ...state.player, boardHistory: {} };
         }
+        return payload;
+      }
+
+      async function writeActiveSession() {
+        if (!dbAvailable) return;
+        const payload = buildSessionPayload();
+        if (!payload) { await idbDelete(IDB.stores.session, "current"); return; }
+        await idbPut(IDB.stores.session, payload);
+      }
+
+      function persistAppSession(force = true) {
+        if (!bootReady) return;
+        if (!dbAvailable) {
+          try {
+            const payload = buildSessionPayload();
+            if (!payload) { localStorage.removeItem(STORAGE.session); return; }
+            const now = Date.now();
+            if (!force && now - lastSessionPersistAt < 900) return;
+            lastSessionPersistAt = now;
+            try {
+              localStorage.setItem(STORAGE.session, JSON.stringify(payload));
+            } catch (error) {
+              if (payload.player) {
+                payload.player.drawings = {};
+                payload.player.boardHistory = {};
+                localStorage.setItem(STORAGE.session, JSON.stringify(payload));
+              } else {
+                throw error;
+              }
+            }
+          } catch (error) {
+            console.warn("Не удалось сохранить текущий прогресс урока:", error);
+          }
+          return;
+        }
+        const now = Date.now();
+        if (!force && now - lastSessionPersistAt < 900) return;
+        lastSessionPersistAt = now;
+        enqueue(async () => { await writeActiveSession(); });
       }
 
       function escapeHtml(value = "") {
@@ -5213,7 +5493,7 @@
 
       function touchLesson(lesson) {
         lesson.updatedAt = new Date().toISOString();
-        persist();
+        persistLesson(lesson);
       }
 
       function captureLessonUndo(label = "последнее изменение") {
@@ -5237,7 +5517,7 @@
           state.lessons[index] = normalizeLesson(JSON.parse(entry.snapshot));
           state.currentLessonId = entry.lessonId;
           state.editorUndo = null;
-          persist();
+          persistLesson(state.lessons[index]);
           renderEditor();
           toast(`Отменено: ${entry.label}`);
         } catch (error) {
@@ -5483,15 +5763,25 @@
           if (IMAGE_BLOCK_TYPES.has(block.type)) {
             const images = Array.isArray(block.images) ? block.images : [];
             block.images = images
-              .filter(image => image && typeof image.data === "string" && image.data.length <= 2000000 && /^data:image\/(?:png|jpe?g|webp);base64,/i.test(image.data))
+              .filter(image => {
+                if (!image) return false;
+                const hasBase64 = typeof image.data === "string" && image.data.length <= 2000000 && /^data:image\/(?:png|jpe?g|webp);base64,/i.test(image.data);
+                const hasRef = typeof image.id === "string" && image.id.length > 0;
+                return hasBase64 || hasRef;
+              })
               .slice(0, MAX_BLOCK_IMAGES)
-              .map(image => ({
-                id: String(image.id || uid("image")),
-                name: String(image.name || "Изображение"),
-                data: image.data,
-                width: Math.max(0, Number(image.width) || 0),
-                height: Math.max(0, Number(image.height) || 0)
-              }));
+              .map(image => {
+                const id = String(image.id || uid("image"));
+                const cached = imageSrcMap.get(id);
+                return {
+                  id,
+                  name: String(image.name || "Изображение"),
+                  data: typeof image.data === "string" && image.data ? image.data : (cached || ""),
+                  width: Math.max(0, Number(image.width) || 0),
+                  height: Math.max(0, Number(image.height) || 0),
+                  type: typeof image.type === "string" ? image.type : "image/webp"
+                };
+              });
           }
           if (block.type === "shortAnswer") {
             if (!Array.isArray(block.items)) block.items = [];
@@ -5667,7 +5957,7 @@
         state.editorStep = 1;
         state.editorUndo = null;
         state.editorCollapsed = {};
-        persist();
+        persistLesson(lesson);
         render();
       }
 
@@ -5688,7 +5978,7 @@
           });
         });
         state.lessons.unshift(copy);
-        persist();
+        persistLesson(copy);
         render();
         toast("Урок продублирован");
       }
@@ -5702,7 +5992,7 @@
           () => {
             state.lessons = state.lessons.filter(item => item.id !== id);
             state.attempts = state.attempts.filter(item => item.lessonId !== id);
-            persist();
+            persistLessonDelete(id);
             render();
             toast("Урок удалён");
           }
@@ -5720,19 +6010,56 @@
         URL.revokeObjectURL(link.href);
       }
 
-      function exportLesson(id) {
-        const lesson = state.lessons.find(item => item.id === id);
-        if (!lesson) return;
-        const safeName = (lesson.title || "урок").replace(/[^\p{L}\p{N}_-]+/gu, "_");
-        exportJson({ kind: "lessonBuilderLesson", version: 1, lesson }, `${safeName}.lesson.json`);
+      async function getImageBlob(id) {
+        if (imageBlobMap.has(id)) return imageBlobMap.get(id);
+        if (!dbAvailable) return null;
+        const record = await idbGet(IDB.stores.images, id);
+        if (record?.blob) {
+          imageBlobMap.set(id, record.blob);
+          return record.blob;
+        }
+        return null;
       }
 
-      function exportAll() {
+      async function inlineLessonImages(lesson) {
+        const clone = JSON.parse(JSON.stringify(lesson));
+        for (const block of clone.blocks || []) {
+          if (!Array.isArray(block.images)) continue;
+          for (const image of block.images) {
+            if (typeof image.data === "string" && image.data.startsWith("data:")) continue;
+            const blob = await getImageBlob(image.id);
+            if (blob) {
+              try {
+                image.data = await blobToDataUrl(blob);
+                image.type = blob.type;
+              } catch (error) {
+                console.warn("Не удалось экспортировать изображение:", error);
+                image.data = "";
+              }
+            } else {
+              image.data = "";
+            }
+          }
+        }
+        return clone;
+      }
+
+      async function exportLesson(id) {
+        const lesson = state.lessons.find(item => item.id === id);
+        if (!lesson) return;
+        const inlined = await inlineLessonImages(lesson);
+        const safeName = (lesson.title || "урок").replace(/[^\p{L}\p{N}_-]+/gu, "_");
+        exportJson({ kind: "lessonBuilderLesson", version: 1, lesson: inlined }, `${safeName}.lesson.json`);
+      }
+
+      async function exportAll() {
+        const inlinedLessons = [];
+        for (const lesson of state.lessons) inlinedLessons.push(await inlineLessonImages(lesson));
         exportJson({
           kind: "lessonBuilderBackup",
           version: 1,
           exportedAt: new Date().toISOString(),
-          lessons: state.lessons,
+          lessons: inlinedLessons,
           attempts: state.attempts
         }, "vse-uroki-backup.json");
       }
@@ -5743,7 +6070,9 @@
         lesson.blocks.forEach(block => {
           block.id = uid("block");
           ["items", "questions", "pairs", "tasks"].forEach(key => {
-            if (Array.isArray(block[key])) block[key].forEach(item => item.id = uid("item"));
+            if (Array.isArray(block[key])) block[key].forEach(item => {
+              if (item && typeof item === "object") item.id = uid("item");
+            });
           });
         });
         return lesson;
@@ -5762,14 +6091,31 @@
         return imported;
       }
 
-      function applyBackupImport(data, mode) {
+      async function ingestImportedImages(lesson) {
+        for (const block of lesson.blocks || []) {
+          if (!Array.isArray(block.images)) continue;
+          for (const image of block.images) {
+            if (typeof image.data === "string" && image.data.startsWith("data:")) {
+              const blob = dataUrlToBlob(image.data);
+              if (blob) {
+                await storeImageBlob(image.id, blob, { name: image.name, width: image.width, height: image.height });
+                image.data = imageSrcMap.get(image.id) || "";
+                image.type = blob.type || "image/webp";
+              }
+            }
+          }
+        }
+      }
+
+      async function applyBackupImport(data, mode) {
         if (mode === "replace") {
           state.lessons = dedupeLessonTitles(data.lessons.map(item => normalizeLesson(JSON.parse(JSON.stringify(item)))));
           state.attempts = Array.isArray(data.attempts) ? data.attempts : [];
           state.view = "library";
           state.currentLessonId = null;
           state.editorUndo = null;
-          persist();
+          for (const lesson of state.lessons) await ingestImportedImages(lesson);
+          persistAll();
           render();
           toast("Библиотека полностью восстановлена");
           return;
@@ -5777,7 +6123,8 @@
         const imported = addImportedLessons(data.lessons);
         state.view = "library";
         state.currentLessonId = null;
-        persist();
+        for (const lesson of imported) await ingestImportedImages(lesson);
+        persistAll();
         render();
         toast(`Добавлено уроков: ${imported.length}`);
       }
@@ -5892,14 +6239,22 @@
           : (data && typeof data === "object" && !Array.isArray(data) && Array.isArray(data.blocks) ? data : null);
 
         if (rawLesson) {
-          dismissImportModal();
           const [lesson] = addImportedLessons([rawLesson]);
           const hasInvalidType = unsupportedBlockTypes(lesson).length > 0;
           state.currentLessonId = hasInvalidType ? null : lesson.id;
           state.view = hasInvalidType ? "library" : "editor";
           state.editorUndo = null;
           state.editorCollapsed = {};
-          persist();
+          dismissImportModal();
+          ingestImportedImages(lesson).then(
+            () => { persistLesson(lesson); render(); },
+            error => {
+              console.warn("Не удалось перенести изображения урока:", error);
+              persistLesson(lesson);
+              render();
+              toast("Не удалось перенести часть изображений");
+            }
+          );
           render();
           toast(hasInvalidType ? "Урок импортирован с неподдерживаемым типом" : "Урок импортирован и открыт");
           return;
@@ -6557,7 +6912,7 @@
               <div class="block-image-editor__grid">
                 ${images.map((image, index) => `
                   <figure class="block-image-tile">
-                    <img src="${escapeHtml(image.data)}" alt="${escapeHtml(image.name || `Изображение ${index + 1}`)}" />
+                    ${image.data ? `<img src="${escapeHtml(image.data)}" alt="${escapeHtml(image.name || `Изображение ${index + 1}`)}" />` : `<div class="block-image-tile__placeholder" aria-hidden="true"></div>`}
                     <figcaption class="block-image-tile__name">${escapeHtml(image.name || `Изображение ${index + 1}`)}</figcaption>
                     <button
                       type="button"
@@ -6583,11 +6938,11 @@
           <div class="block-media-gallery ${images.length === 1 ? "block-media-gallery--single" : ""}">
             ${images.map((image, index) => `
               <figure class="block-media-gallery__item">
-                <img
+                ${image.data ? `<img
                   src="${escapeHtml(image.data)}"
                   alt="${escapeHtml(image.name || `Изображение ${index + 1}`)}"
                   loading="lazy"
-                />
+                />` : ""}
               </figure>
             `).join("")}
           </div>
@@ -6600,6 +6955,15 @@
           image.onload = () => resolve(image);
           image.onerror = () => reject(new Error("Файл не удалось прочитать как изображение"));
           image.src = source;
+        });
+      }
+
+      function canvasToBlob(canvas, type, quality) {
+        return new Promise((resolve, reject) => {
+          canvas.toBlob(blob => {
+            if (blob) resolve(blob);
+            else reject(new Error("Не удалось сжать изображение"));
+          }, type, quality);
         });
       }
 
@@ -6624,11 +6988,11 @@
           context.imageSmoothingQuality = "high";
           context.drawImage(image, 0, 0, canvas.width, canvas.height);
 
-          let data = "";
+          let blob = null;
           const qualities = [.84, .72, .62, .56];
           for (let attempt = 0; attempt < qualities.length; attempt += 1) {
-            data = canvas.toDataURL("image/webp", qualities[attempt]);
-            if (data.length <= 900000) break;
+            blob = await canvasToBlob(canvas, "image/webp", qualities[attempt]);
+            if (blob && blob.size <= 700000) break;
             if (attempt >= 1 && canvas.width > 720 && canvas.height > 720) {
               const smaller = document.createElement("canvas");
               smaller.width = Math.max(1, Math.round(canvas.width * .78));
@@ -6641,16 +7005,20 @@
               context = smallerContext;
             }
           }
-          if (!data || data.length > 1400000) {
+          if (!blob || blob.size > 1_100_000) {
             throw new Error("Изображение не удалось достаточно уменьшить");
           }
 
+          const id = uid("image");
+          const name = String(file.name || "Изображение").slice(0, 120);
+          await storeImageBlob(id, blob, { name, width: canvas.width, height: canvas.height, type: blob.type });
           return {
-            id: uid("image"),
-            name: String(file.name || "Изображение").slice(0, 120),
-            data,
+            id,
+            name,
+            data: imageSrcMap.get(id) || "",
             width: canvas.width,
-            height: canvas.height
+            height: canvas.height,
+            type: blob.type || "image/webp"
           };
         } finally {
           URL.revokeObjectURL(source);
@@ -7256,7 +7624,7 @@
           drawings: {},
           boardHistory: {},
           boardTool: { mode: "pen", color: "#2b2434", size: 4 },
-          boardCollapsed: false
+          boardCollapsed: true
         };
         renderPlayer();
       }
@@ -7660,14 +8028,14 @@
               ${index < 0 ? renderCover(lesson) : renderPlayerBlock(block)}
             </section>
 
-            ${index >= 0 ? renderBoard() : ""}
-
             ${index >= 0 ? `
               <div class="player-nav">
                 <button class="btn btn-secondary" data-action="player-prev">← Назад</button>
                 <button class="btn btn-primary" data-action="player-next">${index === total - 1 ? "Завершить" : "Далее →"}</button>
               </div>
             ` : ""}
+
+            ${index >= 0 ? renderBoard() : ""}
           </main>
           ${siteFooter()}
         `;
@@ -7874,7 +8242,6 @@
             ${block.note ? `<div class="note-box"><strong>Важно:</strong><br>${nl2br(block.note)}</div>` : ""}
             <div class="theory-download-row">
               <button class="btn btn-primary" data-action="download-theory" data-block-id="${block.id}">${modeText("Скачать теорию картинкой", "Экспортировать теорию")}</button>
-              <span class="small-note">Скачивается вертикальная PNG-карточка для отправки ученику.</span>
             </div>
           `;
         }
@@ -8468,6 +8835,69 @@
         return currentY;
       }
 
+      function loadImageElement(src) {
+        return new Promise((resolve, reject) => {
+          if (!src) { reject(new Error("Пустой источник")); return; }
+          const el = new Image();
+          el.onload = () => resolve(el);
+          el.onerror = () => reject(new Error("Не удалось загрузить изображение"));
+          el.src = src;
+        });
+      }
+
+      async function loadBlockImagesForCard(images) {
+        if (!Array.isArray(images) || !images.length) return [];
+        const loaded = [];
+        for (const meta of images) {
+          if (!meta || !meta.data) continue;
+          try {
+            const el = await loadImageElement(meta.data);
+            loaded.push({ meta, el });
+          } catch (error) {
+            console.warn("Не удалось загрузить картинку блока для скачивания:", error);
+          }
+        }
+        return loaded;
+      }
+
+      function computeCardImagesLayout(loaded, containerWidth, options = {}) {
+        const gap = options.gap ?? 16;
+        const maxHeight = options.maxHeight ?? 460;
+        const count = loaded.length;
+        if (!count) return { items: [], totalHeight: 0, gap };
+        const perWidth = Math.floor((containerWidth - gap * (count - 1)) / count);
+        const items = loaded.map(({ meta, el }) => {
+          const naturalW = el.naturalWidth || 1;
+          const naturalH = el.naturalHeight || 1;
+          const ratio = naturalH / naturalW;
+          let w = perWidth;
+          let h = Math.round(perWidth * ratio);
+          if (h > maxHeight) { h = maxHeight; w = Math.round(maxHeight / ratio); }
+          return { el, meta, w, h };
+        });
+        const totalHeight = Math.max(...items.map(i => i.h));
+        return { items, totalHeight, gap };
+      }
+
+      function drawCardImagesRow(context, layout, x, y, containerWidth) {
+        if (!layout?.items?.length) return y;
+        const rowWidth = layout.items.reduce((sum, item, index) => sum + item.w + (index > 0 ? layout.gap : 0), 0);
+        let cursor = x + Math.max(0, Math.round((containerWidth - rowWidth) / 2));
+        for (const item of layout.items) {
+          context.save();
+          roundedRectPath(context, cursor, y, item.w, item.h, 18);
+          context.clip();
+          try { context.drawImage(item.el, cursor, y, item.w, item.h); } catch (error) { console.warn("draw image error:", error); }
+          context.restore();
+          context.strokeStyle = "#d6e8df";
+          context.lineWidth = 1.5;
+          roundedRectPath(context, cursor, y, item.w, item.h, 18);
+          context.stroke();
+          cursor += item.w + layout.gap;
+        }
+        return y + layout.totalHeight;
+      }
+
       async function downloadTheoryCard(block) {
         const lesson = currentLesson();
         if (!lesson || !block || block.type !== "theory") return;
@@ -8505,6 +8935,10 @@
               )
             : null;
 
+          const loadedImages = await loadBlockImagesForCard(block.images);
+          const imagesLayout = computeCardImagesLayout(loadedImages, innerWidth, { maxHeight: 420 });
+          const imagesHeight = imagesLayout.totalHeight ? imagesLayout.totalHeight + 34 : 0;
+
           const labelHeight = 52;
           const metaParts = [];
           if (lesson.topic && lesson.topic.trim() && lesson.topic.trim() !== (block.title || "").trim()) metaParts.push(lesson.topic.trim());
@@ -8515,7 +8949,7 @@
           const noteBoxHeight = noteLayout ? noteLayout.height + 96 : 0;
           const cardHeight = Math.max(
             1180,
-            76 + labelHeight + 30 + titleLayout.height + 16 + metaHeight + 38 + bodyBoxHeight + (noteLayout ? 26 + noteBoxHeight : 0) + 54
+            76 + labelHeight + 30 + titleLayout.height + 16 + metaHeight + 38 + bodyBoxHeight + imagesHeight + (noteLayout ? 26 + noteBoxHeight : 0) + 54
           );
           const height = cardHeight + outerPadding * 2;
           const canvas = document.createElement("canvas");
@@ -8591,6 +9025,11 @@
           drawHomeworkRichText(context, bodyLayout, innerX + 34, y + 32);
           y += bodyBoxHeight;
 
+          if (imagesLayout.items.length) {
+            y += 34;
+            y = drawCardImagesRow(context, imagesLayout, innerX, y, innerWidth);
+          }
+
           if (noteLayout) {
             y += 26;
             roundedRectPath(context, innerX, y, innerWidth, noteBoxHeight, 24);
@@ -8662,12 +9101,16 @@
             ));
           }
 
+          const loadedImages = await loadBlockImagesForCard(block.images);
+          const imagesLayout = computeCardImagesLayout(loadedImages, innerWidth, { maxHeight: 420 });
+          const imagesHeight = imagesLayout.totalHeight ? imagesLayout.totalHeight + 34 : 0;
+
           const labelHeight = 52;
           const metaHeight = [lesson.subject, lesson.grade].filter(Boolean).length ? 42 : 0;
           const noteHeight = noteLayout ? noteLayout.height + 48 : 0;
           const tasksHeight = taskLayouts.reduce((sum, layout) => sum + Math.max(104, layout.height + 44) + 18, 0);
           const cardHeight = Math.max(1210,
-            76 + labelHeight + 30 + titleLayout.height + 16 + metaHeight + 34 + noteHeight + 26 + tasksHeight + 38
+            76 + labelHeight + 30 + titleLayout.height + 16 + metaHeight + 34 + noteHeight + 26 + tasksHeight + imagesHeight + 38
           );
           const height = cardHeight + outerPadding * 2;
           const canvas = document.createElement("canvas");
@@ -8771,6 +9214,11 @@
             y += taskHeight + 18;
           }
 
+          if (imagesLayout.items.length) {
+            y += 20;
+            y = drawCardImagesRow(context, imagesLayout, innerX, y, innerWidth);
+          }
+
           const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, "image/png", .96));
           if (!pngBlob) throw new Error("Не удалось создать PNG");
           const safeName = (lesson.topic || lesson.title || "домашнее_задание").replace(/[^\p{L}\p{N}_-]+/gu, "_");
@@ -8831,7 +9279,7 @@
         if (target.dataset.settingField) {
           const field = target.dataset.settingField;
           state.settings[field] = target.type === "checkbox" ? target.checked : target.value;
-          persist();
+          persistSettingsOnly();
           if (field === "timerSound" && target.checked) primeTimerAudio();
           return;
         }
@@ -9157,6 +9605,68 @@
         });
       });
 
+      // Меню «Ещё» ловит overflow:hidden у карточек-предков, поэтому переводим
+      // список в position:fixed при открытии — он выпадает поверх всего.
+      function positionOpenMenu(menu) {
+        const summary = menu?.querySelector(":scope > summary");
+        const list = menu?.querySelector(":scope > .menu__list");
+        if (!summary || !list) return;
+        list.style.position = "fixed";
+        list.style.right = "auto";
+        list.style.zIndex = "9999";
+        list.style.top = "0px";
+        list.style.left = "0px";
+        const listWidth = list.offsetWidth;
+        const listHeight = list.offsetHeight;
+        const summaryRect = summary.getBoundingClientRect();
+        const viewportW = window.innerWidth || document.documentElement.clientWidth;
+        const viewportH = window.innerHeight || document.documentElement.clientHeight;
+        let left = summaryRect.right - listWidth;
+        if (left < 8) left = 8;
+        if (left + listWidth > viewportW - 8) left = viewportW - listWidth - 8;
+        let top = summaryRect.bottom + 6;
+        if (top + listHeight > viewportH - 12) {
+          const upTop = summaryRect.top - listHeight - 6;
+          if (upTop >= 12) {
+            top = upTop;
+          } else {
+            top = Math.max(12, viewportH - listHeight - 12);
+          }
+        }
+        list.style.top = `${Math.round(top)}px`;
+        list.style.left = `${Math.round(left)}px`;
+      }
+
+      function resetMenuPosition(menu) {
+        const list = menu?.querySelector(":scope > .menu__list");
+        if (!list) return;
+        list.style.position = "";
+        list.style.top = "";
+        list.style.left = "";
+        list.style.right = "";
+        list.style.zIndex = "";
+      }
+
+      document.addEventListener("click", event => {
+        const summary = event.target.closest(".menu > summary");
+        if (!summary) return;
+        const menu = summary.parentElement;
+        requestAnimationFrame(() => {
+          if (menu?.open) positionOpenMenu(menu);
+          else resetMenuPosition(menu);
+        });
+      }, true);
+
+      // При скролле или ресайзе fixed-меню отвязывается от кнопки — просто закроем
+      const closeAllMenus = () => {
+        document.querySelectorAll("details.menu[open]").forEach(menu => {
+          menu.removeAttribute("open");
+          resetMenuPosition(menu);
+        });
+      };
+      window.addEventListener("scroll", closeAllMenus, true);
+      window.addEventListener("resize", closeAllMenus);
+
       app.addEventListener("click", event => {
         const button = event.target.closest("[data-action]");
         if (!button) return;
@@ -9243,7 +9753,7 @@
         if (action === "close-palette") { state.paletteOpen = false; renderEditor(); }
         if (action === "set-mode") {
           state.settings.simpleMode = button.dataset.mode === "simple";
-          persist();
+          persistSettingsOnly();
           render();
         }
         if (action === "toggle-block-field") {
@@ -9687,7 +10197,161 @@
         persistAppSession();
       });
 
+      async function migrateFromLocalStorage() {
+        const rawLessons = load(STORAGE.lessons, []);
+        const rawAttempts = load(STORAGE.attempts, []);
+        const rawSettings = load(STORAGE.settings, {});
+        const rawSession = load(STORAGE.session, null);
+        const seedFlag = Number(load(STORAGE.templateSeed, 0));
+
+        if (Array.isArray(rawLessons) && rawLessons.length) {
+          for (const rawLesson of rawLessons) {
+            if (!rawLesson || typeof rawLesson !== "object") continue;
+            if (Array.isArray(rawLesson.blocks)) {
+              for (const block of rawLesson.blocks) {
+                if (!block || !Array.isArray(block.images)) continue;
+                for (const image of block.images) {
+                  if (!image) continue;
+                  if (!image.id) image.id = uid("image");
+                  if (typeof image.data === "string" && image.data.startsWith("data:")) {
+                    const blob = dataUrlToBlob(image.data);
+                    if (blob) {
+                      await storeImageBlob(image.id, blob, {
+                        name: image.name,
+                        width: image.width,
+                        height: image.height
+                      });
+                      image.type = blob.type || "image/webp";
+                      delete image.data;
+                    }
+                  }
+                }
+              }
+            }
+            await idbPut(IDB.stores.lessons, rawLesson);
+          }
+        }
+
+        await idbPut(IDB.stores.meta, { key: "attempts", value: Array.isArray(rawAttempts) ? rawAttempts : [] });
+        await idbPut(IDB.stores.meta, { key: "settings", value: rawSettings && typeof rawSettings === "object" ? rawSettings : {} });
+        if (seedFlag) await idbPut(IDB.stores.meta, { key: "templateSeed", value: seedFlag });
+        if (rawSession && typeof rawSession === "object") {
+          await idbPut(IDB.stores.session, { ...rawSession, key: "current" });
+        }
+        await idbPut(IDB.stores.meta, { key: "migration_v1_done", value: true, migratedAt: new Date().toISOString() });
+
+        try { localStorage.setItem(STORAGE.migrationFlag, "1"); } catch (_) {}
+        for (const key of [STORAGE.lessons, STORAGE.attempts, STORAGE.session, STORAGE.templateSeed]) {
+          try { localStorage.removeItem(key); } catch (_) {}
+        }
+      }
+
+      async function loadImagesFromDB() {
+        if (!dbAvailable) return;
+        const records = await idbGetAll(IDB.stores.images);
+        for (const record of records) {
+          if (!record?.id || !record?.blob) continue;
+          imageBlobMap.set(record.id, record.blob);
+          try {
+            imageSrcMap.set(record.id, URL.createObjectURL(record.blob));
+          } catch (error) {
+            console.warn("Не удалось создать object URL для изображения:", error);
+          }
+        }
+      }
+
+      async function loadStateFromDB() {
+        if (!dbAvailable) {
+          const storedLessons = load(STORAGE.lessons, []).map(normalizeLesson);
+          const alreadySeeded = Number(load(STORAGE.templateSeed, 0)) >= TEMPLATE_SEED_VERSION;
+          state.lessons = alreadySeeded
+            ? dedupeLessonTitles(storedLessons)
+            : dedupeLessonTitles([
+                ...builtInLessonTemplates().filter(t => !storedLessons.some(l => l.id === t.id)).map(normalizeLesson),
+                ...storedLessons
+              ]);
+          state.attempts = load(STORAGE.attempts, []);
+          state.settings = { timerSound: true, simpleMode: true, ...load(STORAGE.settings, {}) };
+          restoreSavedSession(load(STORAGE.session, null));
+          if (!alreadySeeded) {
+            try {
+              localStorage.setItem(STORAGE.lessons, JSON.stringify(state.lessons));
+              localStorage.setItem(STORAGE.templateSeed, JSON.stringify(TEMPLATE_SEED_VERSION));
+            } catch (error) { console.warn("Не удалось сохранить встроенные шаблоны:", error); }
+          }
+          return;
+        }
+        const lessonRecords = await idbGetAll(IDB.stores.lessons);
+        const attemptsRecord = await idbGet(IDB.stores.meta, "attempts");
+        const settingsRecord = await idbGet(IDB.stores.meta, "settings");
+        const seedRecord = await idbGet(IDB.stores.meta, "templateSeed");
+        const sessionRecord = await idbGet(IDB.stores.session, "current");
+
+        const storedLessons = (lessonRecords || []).map(record => hydrateLessonImages(normalizeLesson(record)));
+        const alreadySeeded = Number(seedRecord?.value || 0) >= TEMPLATE_SEED_VERSION;
+        state.lessons = alreadySeeded
+          ? dedupeLessonTitles(storedLessons)
+          : dedupeLessonTitles([
+              ...builtInLessonTemplates().filter(t => !storedLessons.some(l => l.id === t.id)).map(normalizeLesson),
+              ...storedLessons
+            ]);
+        state.attempts = Array.isArray(attemptsRecord?.value) ? attemptsRecord.value : [];
+        state.settings = { timerSound: true, simpleMode: true, ...(settingsRecord?.value && typeof settingsRecord.value === "object" ? settingsRecord.value : {}) };
+        restoreSavedSession(sessionRecord || null);
+
+        if (!alreadySeeded) {
+          for (const lesson of state.lessons) await idbPut(IDB.stores.lessons, serializeLessonForDb(lesson));
+          await idbPut(IDB.stores.meta, { key: "templateSeed", value: TEMPLATE_SEED_VERSION });
+        }
+      }
+
+      async function bootstrap() {
+        ensureSaveStatusWidget();
+        try {
+          db = await openDB();
+          dbAvailable = true;
+        } catch (error) {
+          dbAvailable = false;
+          console.warn("IndexedDB недоступна, переходим в запасной режим:", error);
+          setSaveStatus({ state: "error", message: "Хранилище браузера ограничено", error });
+        }
+
+        try {
+          if (dbAvailable) {
+            const flagRecord = await idbGet(IDB.stores.meta, "migration_v1_done");
+            const alreadyMigrated = Boolean(flagRecord?.value) || load(STORAGE.migrationFlag, null) === "1";
+            const hasLegacy = Boolean(localStorage.getItem(STORAGE.lessons));
+            if (!alreadyMigrated && hasLegacy) {
+              try {
+                await migrateFromLocalStorage();
+              } catch (migrationError) {
+                console.warn("Ошибка миграции из localStorage:", migrationError);
+                setSaveStatus({ state: "error", message: "Миграция не завершена", error: migrationError });
+              }
+            } else if (!alreadyMigrated) {
+              await idbPut(IDB.stores.meta, { key: "migration_v1_done", value: true, migratedAt: new Date().toISOString() });
+              try { localStorage.setItem(STORAGE.migrationFlag, "1"); } catch (_) {}
+            }
+            await loadImagesFromDB();
+          }
+          await loadStateFromDB();
+        } catch (error) {
+          console.warn("Не удалось загрузить данные:", error);
+          setSaveStatus({ state: "error", message: "Ошибка загрузки", error });
+        } finally {
+          bootReady = true;
+        }
+      }
+
+      window.addEventListener("beforeunload", () => {
+        const canvas = document.getElementById("solutionBoard");
+        const key = currentBoardKey();
+        if (canvas && key) saveBoardDrawing(canvas, key);
+        persistAppSession();
+      });
+
       window.addEventListener("storage", event => {
+        if (dbAvailable) return;
         if (event.key === STORAGE.lessons || event.key === STORAGE.attempts || event.key === STORAGE.settings) {
           state.lessons = dedupeLessonTitles(load(STORAGE.lessons, []).map(normalizeLesson));
           state.attempts = load(STORAGE.attempts, []);
@@ -9696,7 +10360,11 @@
         }
       });
 
-      render();
+      bootstrap().then(render).catch(error => {
+        console.error("Критическая ошибка запуска:", error);
+        bootReady = true;
+        render();
+      });
     })();
   </script>
 
