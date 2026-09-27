@@ -9598,25 +9598,67 @@
         });
       });
 
-      // Когда меню «Ещё» открывается на нижних блоках — подтянуть список в видимую область
+      // Меню «Ещё» ловит overflow:hidden у карточек-предков, поэтому переводим
+      // список в position:fixed при открытии — он выпадает поверх всего.
+      function positionOpenMenu(menu) {
+        const summary = menu?.querySelector(":scope > summary");
+        const list = menu?.querySelector(":scope > .menu__list");
+        if (!summary || !list) return;
+        list.style.position = "fixed";
+        list.style.right = "auto";
+        list.style.zIndex = "9999";
+        list.style.top = "0px";
+        list.style.left = "0px";
+        const listWidth = list.offsetWidth;
+        const listHeight = list.offsetHeight;
+        const summaryRect = summary.getBoundingClientRect();
+        const viewportW = window.innerWidth || document.documentElement.clientWidth;
+        const viewportH = window.innerHeight || document.documentElement.clientHeight;
+        let left = summaryRect.right - listWidth;
+        if (left < 8) left = 8;
+        if (left + listWidth > viewportW - 8) left = viewportW - listWidth - 8;
+        let top = summaryRect.bottom + 6;
+        if (top + listHeight > viewportH - 12) {
+          const upTop = summaryRect.top - listHeight - 6;
+          if (upTop >= 12) {
+            top = upTop;
+          } else {
+            top = Math.max(12, viewportH - listHeight - 12);
+          }
+        }
+        list.style.top = `${Math.round(top)}px`;
+        list.style.left = `${Math.round(left)}px`;
+      }
+
+      function resetMenuPosition(menu) {
+        const list = menu?.querySelector(":scope > .menu__list");
+        if (!list) return;
+        list.style.position = "";
+        list.style.top = "";
+        list.style.left = "";
+        list.style.right = "";
+        list.style.zIndex = "";
+      }
+
       document.addEventListener("click", event => {
         const summary = event.target.closest(".menu > summary");
         if (!summary) return;
         const menu = summary.parentElement;
         requestAnimationFrame(() => {
-          if (!menu?.open) return;
-          const list = menu.querySelector(".menu__list");
-          if (!list || typeof list.getBoundingClientRect !== "function") return;
-          const rect = list.getBoundingClientRect();
-          const viewportH = window.innerHeight || document.documentElement.clientHeight;
-          const overflowBottom = rect.bottom - viewportH + 24;
-          if (overflowBottom > 0) {
-            window.scrollBy({ top: overflowBottom, left: 0, behavior: "smooth" });
-          } else if (rect.top < 12) {
-            window.scrollBy({ top: rect.top - 12, left: 0, behavior: "smooth" });
-          }
+          if (menu?.open) positionOpenMenu(menu);
+          else resetMenuPosition(menu);
         });
       }, true);
+
+      // При скролле или ресайзе fixed-меню отвязывается от кнопки — просто закроем
+      const closeAllMenus = () => {
+        document.querySelectorAll("details.menu[open]").forEach(menu => {
+          menu.removeAttribute("open");
+          resetMenuPosition(menu);
+        });
+      };
+      window.addEventListener("scroll", closeAllMenus, true);
+      window.addEventListener("resize", closeAllMenus);
 
       app.addEventListener("click", event => {
         const button = event.target.closest("[data-action]");
