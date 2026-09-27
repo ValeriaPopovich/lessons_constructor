@@ -8828,6 +8828,69 @@
         return currentY;
       }
 
+      function loadImageElement(src) {
+        return new Promise((resolve, reject) => {
+          if (!src) { reject(new Error("Пустой источник")); return; }
+          const el = new Image();
+          el.onload = () => resolve(el);
+          el.onerror = () => reject(new Error("Не удалось загрузить изображение"));
+          el.src = src;
+        });
+      }
+
+      async function loadBlockImagesForCard(images) {
+        if (!Array.isArray(images) || !images.length) return [];
+        const loaded = [];
+        for (const meta of images) {
+          if (!meta || !meta.data) continue;
+          try {
+            const el = await loadImageElement(meta.data);
+            loaded.push({ meta, el });
+          } catch (error) {
+            console.warn("Не удалось загрузить картинку блока для скачивания:", error);
+          }
+        }
+        return loaded;
+      }
+
+      function computeCardImagesLayout(loaded, containerWidth, options = {}) {
+        const gap = options.gap ?? 16;
+        const maxHeight = options.maxHeight ?? 460;
+        const count = loaded.length;
+        if (!count) return { items: [], totalHeight: 0, gap };
+        const perWidth = Math.floor((containerWidth - gap * (count - 1)) / count);
+        const items = loaded.map(({ meta, el }) => {
+          const naturalW = el.naturalWidth || 1;
+          const naturalH = el.naturalHeight || 1;
+          const ratio = naturalH / naturalW;
+          let w = perWidth;
+          let h = Math.round(perWidth * ratio);
+          if (h > maxHeight) { h = maxHeight; w = Math.round(maxHeight / ratio); }
+          return { el, meta, w, h };
+        });
+        const totalHeight = Math.max(...items.map(i => i.h));
+        return { items, totalHeight, gap };
+      }
+
+      function drawCardImagesRow(context, layout, x, y, containerWidth) {
+        if (!layout?.items?.length) return y;
+        const rowWidth = layout.items.reduce((sum, item, index) => sum + item.w + (index > 0 ? layout.gap : 0), 0);
+        let cursor = x + Math.max(0, Math.round((containerWidth - rowWidth) / 2));
+        for (const item of layout.items) {
+          context.save();
+          roundedRectPath(context, cursor, y, item.w, item.h, 18);
+          context.clip();
+          try { context.drawImage(item.el, cursor, y, item.w, item.h); } catch (error) { console.warn("draw image error:", error); }
+          context.restore();
+          context.strokeStyle = "#d6e8df";
+          context.lineWidth = 1.5;
+          roundedRectPath(context, cursor, y, item.w, item.h, 18);
+          context.stroke();
+          cursor += item.w + layout.gap;
+        }
+        return y + layout.totalHeight;
+      }
+
       async function downloadTheoryCard(block) {
         const lesson = currentLesson();
         if (!lesson || !block || block.type !== "theory") return;
@@ -8865,6 +8928,10 @@
               )
             : null;
 
+          const loadedImages = await loadBlockImagesForCard(block.images);
+          const imagesLayout = computeCardImagesLayout(loadedImages, innerWidth, { maxHeight: 420 });
+          const imagesHeight = imagesLayout.totalHeight ? imagesLayout.totalHeight + 34 : 0;
+
           const labelHeight = 52;
           const metaParts = [];
           if (lesson.topic && lesson.topic.trim() && lesson.topic.trim() !== (block.title || "").trim()) metaParts.push(lesson.topic.trim());
@@ -8875,7 +8942,7 @@
           const noteBoxHeight = noteLayout ? noteLayout.height + 96 : 0;
           const cardHeight = Math.max(
             1180,
-            76 + labelHeight + 30 + titleLayout.height + 16 + metaHeight + 38 + bodyBoxHeight + (noteLayout ? 26 + noteBoxHeight : 0) + 54
+            76 + labelHeight + 30 + titleLayout.height + 16 + metaHeight + 38 + bodyBoxHeight + imagesHeight + (noteLayout ? 26 + noteBoxHeight : 0) + 54
           );
           const height = cardHeight + outerPadding * 2;
           const canvas = document.createElement("canvas");
@@ -8951,6 +9018,11 @@
           drawHomeworkRichText(context, bodyLayout, innerX + 34, y + 32);
           y += bodyBoxHeight;
 
+          if (imagesLayout.items.length) {
+            y += 34;
+            y = drawCardImagesRow(context, imagesLayout, innerX, y, innerWidth);
+          }
+
           if (noteLayout) {
             y += 26;
             roundedRectPath(context, innerX, y, innerWidth, noteBoxHeight, 24);
@@ -9022,12 +9094,16 @@
             ));
           }
 
+          const loadedImages = await loadBlockImagesForCard(block.images);
+          const imagesLayout = computeCardImagesLayout(loadedImages, innerWidth, { maxHeight: 420 });
+          const imagesHeight = imagesLayout.totalHeight ? imagesLayout.totalHeight + 34 : 0;
+
           const labelHeight = 52;
           const metaHeight = [lesson.subject, lesson.grade].filter(Boolean).length ? 42 : 0;
           const noteHeight = noteLayout ? noteLayout.height + 48 : 0;
           const tasksHeight = taskLayouts.reduce((sum, layout) => sum + Math.max(104, layout.height + 44) + 18, 0);
           const cardHeight = Math.max(1210,
-            76 + labelHeight + 30 + titleLayout.height + 16 + metaHeight + 34 + noteHeight + 26 + tasksHeight + 38
+            76 + labelHeight + 30 + titleLayout.height + 16 + metaHeight + 34 + noteHeight + 26 + tasksHeight + imagesHeight + 38
           );
           const height = cardHeight + outerPadding * 2;
           const canvas = document.createElement("canvas");
@@ -9129,6 +9205,11 @@
             context.textBaseline = "alphabetic";
             drawHomeworkRichText(context, layout, innerX + 100, y + 22);
             y += taskHeight + 18;
+          }
+
+          if (imagesLayout.items.length) {
+            y += 20;
+            y = drawCardImagesRow(context, imagesLayout, innerX, y, innerWidth);
           }
 
           const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, "image/png", .96));
@@ -9516,6 +9597,26 @@
           if (!menu.contains(event.target)) menu.removeAttribute("open");
         });
       });
+
+      // Когда меню «Ещё» открывается на нижних блоках — подтянуть список в видимую область
+      document.addEventListener("click", event => {
+        const summary = event.target.closest(".menu > summary");
+        if (!summary) return;
+        const menu = summary.parentElement;
+        requestAnimationFrame(() => {
+          if (!menu?.open) return;
+          const list = menu.querySelector(".menu__list");
+          if (!list || typeof list.getBoundingClientRect !== "function") return;
+          const rect = list.getBoundingClientRect();
+          const viewportH = window.innerHeight || document.documentElement.clientHeight;
+          const overflowBottom = rect.bottom - viewportH + 24;
+          if (overflowBottom > 0) {
+            window.scrollBy({ top: overflowBottom, left: 0, behavior: "smooth" });
+          } else if (rect.top < 12) {
+            window.scrollBy({ top: rect.top - 12, left: 0, behavior: "smooth" });
+          }
+        });
+      }, true);
 
       app.addEventListener("click", event => {
         const button = event.target.closest("[data-action]");
